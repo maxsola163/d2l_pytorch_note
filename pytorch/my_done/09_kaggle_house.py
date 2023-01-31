@@ -10,6 +10,12 @@ from torch import nn
 import time
 import os
 
+""" 尝试使用GPU """
+def try_gpu(i=0):
+    if torch.cuda.device_count() >= i+1:
+        return torch.device(f"cuda:{i}")
+    else:
+        return torch.device("cpu")
 
 def data_read(path='.'):
     """ 数据读取 """
@@ -53,19 +59,19 @@ def get_net(train_feature):
         nn.ReLU(),
         nn.Linear(128, 64),
         nn.ReLU(),
-        nn.Linear(64, 16),
-        nn.ReLU(),
-        nn.Linear(16, 1)
+        nn.Linear(64, 1)
     )
     return net
 
 
 def log_rmse(net, features, labels):
     """ 损失函数"""
+    features=features.to(device=try_gpu())
+    labels=labels.to(device=try_gpu())
     clipped_preds = torch.clamp(net(features), 1, float('inf'))
     rmse = torch.sqrt(loss(torch.log(clipped_preds),
                            torch.log(labels)))
-    return rmse.item()
+    return rmse.to(device='cpu').item()
 
 
 def load_array(data_array, batch_size, is_train=False):
@@ -78,6 +84,8 @@ def train(net, train_features, train_labels, test_features, test_labels,
           num_epochs, learning_rate, weight_decay, batch_size):
     """ 训练函数 """
     train_ls, test_ls = [], []
+    train_features=train_features.to(device=try_gpu())
+    train_labels=train_labels.to(device=try_gpu())
     train_iter = load_array((train_features, train_labels), batch_size, is_train=True)
     optimizer = torch.optim.Adam(net.parameters(),
                                  lr=learning_rate,
@@ -120,6 +128,7 @@ def k_fold(k, X_train, y_train, num_epochs, learning_rate, weight_decay,
         start=time.perf_counter()
         data = get_k_fold_data(k, i, X_train, y_train)
         net = get_net(train_feature=X_train)
+        net.to(device=try_gpu())
         train_ls, valid_ls = train(net, *data, num_epochs, learning_rate,
                                    weight_decay, batch_size)
         train_l_sum += train_ls[-1]
@@ -136,9 +145,9 @@ if __name__ == '__main__':
     print(f"Start time {time.asctime(time.localtime())}")
 
     train_features, train_labels, test_features, test = data_read(os.path.join(".", "data"));
-    loss = nn.MSELoss()
+    loss = nn.MSELoss().to(device=try_gpu())
 
-    k, num_epochs, lr, weight_decay, batch_size = 5, 500, 0.01, 0.0001, 64
+    k, num_epochs, lr, weight_decay, batch_size = 5, 300, 0.05, 0.0001, 256
     train_l, valid_l, net = k_fold(k, train_features, train_labels, num_epochs, lr, weight_decay, batch_size)
     print(f'{k}-折验证: 平均训练log rmse: {float(train_l):f}, 'f'平均验证log rmse: {float(valid_l):f}')
     torch.save(net, os.path.join(".", "data", f"{k}_{num_epochs}_{lr}_{train_l:.3f}.pkl"))
