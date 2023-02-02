@@ -9,6 +9,8 @@ import torch
 from torch import nn
 import time
 import os
+import platform
+
 
 """ 尝试使用GPU """
 def try_gpu(i=0):
@@ -53,21 +55,31 @@ def data_read(path='.'):
 def get_net(train_feature):
     """MLP生成"""
     net = nn.Sequential(
-        nn.Linear(train_feature.shape[-1], 256),
-        nn.ReLU(),
-        nn.Linear(256, 128),
+        nn.Linear(train_feature.shape[-1], 128),
         nn.ReLU(),
         nn.Linear(128, 64),
         nn.ReLU(),
-        nn.Linear(64, 1)
+        nn.Dropout(0.5),
+        nn.Linear(64, 64),
+        nn.ReLU(),
+        nn.Dropout(0.5),
+        nn.Linear(64, 64),
+        nn.ReLU(),
+        nn.Dropout(0.5),
+        nn.Linear(64, 32),
+        nn.ReLU(),
+        nn.Dropout(0.8),
+        nn.Linear(32, 16),
+        nn.ReLU(),
+        nn.Linear(16, 1)
     )
     return net
 
 
-def log_rmse(net, features, labels):
+def log_rmse(net, features, labels, device='cpu'):
     """ 损失函数"""
-    features=features.to(device=try_gpu())
-    labels=labels.to(device=try_gpu())
+    features=features.to(device)
+    labels=labels.to(device)
     clipped_preds = torch.clamp(net(features), 1, float('inf'))
     rmse = torch.sqrt(loss(torch.log(clipped_preds),
                            torch.log(labels)))
@@ -84,21 +96,20 @@ def train(net, train_features, train_labels, test_features, test_labels,
           num_epochs, learning_rate, weight_decay, batch_size):
     """ 训练函数 """
     train_ls, test_ls = [], []
-    train_features=train_features.to(device=try_gpu())
-    train_labels=train_labels.to(device=try_gpu())
     train_iter = load_array((train_features, train_labels), batch_size, is_train=True)
     optimizer = torch.optim.Adam(net.parameters(),
                                  lr=learning_rate,
                                  weight_decay=weight_decay)
     for epoch in range(num_epochs):
         for X, y in train_iter:
+            X, y = X.to(try_gpu()), y.to(try_gpu())
             optimizer.zero_grad()
             l = loss(net(X), y)
             l.backward()
             optimizer.step()
-        train_ls.append(log_rmse(net, train_features, train_labels))
+        train_ls.append(log_rmse(net, train_features, train_labels, try_gpu()))
         if test_labels is not None:
-            test_ls.append(log_rmse(net, test_features, test_labels))
+            test_ls.append(log_rmse(net, test_features, test_labels, try_gpu()))
     return train_ls, test_ls
 
 
@@ -129,8 +140,7 @@ def k_fold(k, X_train, y_train, num_epochs, learning_rate, weight_decay,
         data = get_k_fold_data(k, i, X_train, y_train)
         net = get_net(train_feature=X_train)
         net.to(device=try_gpu())
-        train_ls, valid_ls = train(net, *data, num_epochs, learning_rate,
-                                   weight_decay, batch_size)
+        train_ls, valid_ls = train(net, *data, num_epochs, learning_rate, weight_decay, batch_size)
         train_l_sum += train_ls[-1]
         valid_l_sum += valid_ls[-1]
         end=time.perf_counter()
@@ -141,21 +151,28 @@ def k_fold(k, X_train, y_train, num_epochs, learning_rate, weight_decay,
 
 
 if __name__ == '__main__':
+    
+    if platform.system() == "Linux":
+        os.system('clear')
+    elif platform.system() == "Windows":
+        os.system('cls')
 
     print(f"Start time {time.asctime(time.localtime())}")
 
     train_features, train_labels, test_features, test = data_read(os.path.join(".", "data"));
-    loss = nn.MSELoss().to(device=try_gpu())
-
-    k, num_epochs, lr, weight_decay, batch_size = 5, 300, 0.05, 0.0001, 256
+    loss = nn.MSELoss()
+    
+    k, num_epochs, lr, weight_decay, batch_size = 5, 1000, 1, 0.0001, 64
     train_l, valid_l, net = k_fold(k, train_features, train_labels, num_epochs, lr, weight_decay, batch_size)
     print(f'{k}-折验证: 平均训练log rmse: {float(train_l):f}, 'f'平均验证log rmse: {float(valid_l):f}')
     torch.save(net, os.path.join(".", "data", f"{k}_{num_epochs}_{lr}_{train_l:.3f}.pkl"))
 
+    net.to(torch.device('cpu'))
     preds = net(test_features).detach().numpy()
     test['Sold Price'] = pd.Series(preds.reshape(1, -1)[0])
     submission = pd.concat([test['Id'], test['Sold Price']], axis=1)
     submission.to_csv(os.path.join('.','data', 'submission.csv'), index=False)
 
-    print(log_rmse(net, train_features, train_labels))
-    os.system("pause")
+    print(log_rmse(net, train_features, train_labels, torch.device('cpu')))
+    if platform.system() == 'Windows':
+        os.system("pause")
