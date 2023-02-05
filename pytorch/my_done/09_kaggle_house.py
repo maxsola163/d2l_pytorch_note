@@ -131,8 +131,7 @@ def get_k_fold_data(k, i, X, y):
     return X_train, y_train, X_valid, y_valid
 
 
-def k_fold(k, X_train, y_train, num_epochs, learning_rate, weight_decay,
-           batch_size):
+def k_fold(k, X_train, y_train, num_epochs, learning_rate, weight_decay, batch_size):
     """ K折训练 """
     train_l_sum, valid_l_sum = 0, 0
     for i in range(k):
