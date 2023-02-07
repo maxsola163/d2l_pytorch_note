@@ -1,3 +1,5 @@
+from torch.cuda.amp import autocast as autocast
+from torch.cuda.amp import GradScaler
 import torch
 import torchvision
 from torch.utils.data import DataLoader
@@ -11,9 +13,6 @@ import warnings
 import numpy as np
 import pandas as pd
 from PIL import Image
-from matplotlib import pyplot as plt
-from matplotlib_inline import backend_inline
-import sys
 
 class Accumulator: # 累加器对象
     """ 在 n 个变量上累加 """
@@ -108,57 +107,6 @@ def get_net(num_class):
     )
     return net
 
-
-"""
-class Residual(torch.nn.Module):
-    def __init__(self, input_channels, num_channels, use_1x1_conv=False, strides=1):
-        super().__init__()
-        self.conv1 = nn.Conv2d(input_channels, num_channels, kernel_size=3, padding=1, stride=strides)
-        self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
-        if use_1x1_conv:
-            self.conv3 = nn.Conv2d(input_channels, num_channels, kernel_size=1, stride=strides)
-        else:
-            self.conv3 = None
-        self.bn1 = nn.BatchNorm2d(num_channels)
-        self.bn2 = nn.BatchNorm2d(num_channels)
-        self.relu = nn.ReLU()
-        
-    def forward(self, X):
-        Y = F.relu(self.bn1(self.conv1(X)))
-        Y = self.bn2(self.conv2(Y))
-        if self.conv3:
-            X = self.conv3(X)
-        Y += X
-        return F.relu(Y)
-    
-def resnet_block(input_channels, num_channels, num_residuals, is_first=False):
-    blk = []
-    for i in range(num_residuals):
-        if i == 0 and not is_first:
-            blk.append(Residual(input_channels, num_channels, use_1x1_conv=True, strides=2))
-        else:
-            blk.append(Residual(num_channels, num_channels))
-    return blk
-
-
-def get_net(num_class):
-    b1 = nn.Sequential(nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
-                   nn.BatchNorm2d(64), nn.ReLU(),
-                   nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
-
-    b2 = nn.Sequential(*resnet_block(64, 64, 2, is_first=True))
-    b3 = nn.Sequential(*resnet_block(64, 128, 2))
-    b4 = nn.Sequential(*resnet_block(128, 256, 2))
-    b5 = nn.Sequential(*resnet_block(256, 512, 2))
-
-    net = nn.Sequential(
-        b1, b2, b3, b4, b5,
-        nn.AdaptiveAvgPool2d((1, 1)),
-        nn.Flatten(),
-        nn.Linear(512, num_class)
-    )
-    return net
-"""
 def try_gpu(i=0):
     if torch.cuda.device_count() >= i+1:
         return torch.device(f"cuda:{i}")
@@ -208,12 +156,8 @@ def evaluate_accuracy_gpu(net, data_iter):
     return metric[0] / metric[1]
 
 def train_gpu(net, train_iter, test_iter, num_epochs, lr):
-    def init_weight(m):
-        if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv2d:
-            torch.nn.init.kaiming_uniform_(m.weight)
-            torch.nn.init.zeros_(m.bias)
-    net.apply(init_weight)
-    optimizer = torch.optim.Adam(params=net.parameters(), lr=lr, weight_decay=1e-5)
+    scaler = GradScaler()
+    optimizer = torch.optim.SGD(params=net.parameters(), lr=lr, weight_decay=1e-5)
     loss = torch.nn.CrossEntropyLoss()
     # 余弦退火
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -229,22 +173,29 @@ def train_gpu(net, train_iter, test_iter, num_epochs, lr):
         for X, y in train_iter:
             X, y = X.to(device), y.to(device)
             optimizer.zero_grad()
-            y_hat = net(X)
-            l = loss(y_hat, y)
-            l.backward()
-            optimizer.step()
-            scheduler.step()
+            with autocast():
+                y_hat = net(X)
+                l = loss(y_hat, y)
+            scaler.scale(l).backward()
+            scaler.step(optimizer)
+            scaler.update()
             with torch.no_grad():
                 metric.add(l * X.shape[0], accuracy(y_hat=y_hat, y=y), X.shape[0])
+        scheduler.step()
         end = time.perf_counter()
         train_l.append(metric[0] / metric[2])
         train_acc.append(metric[1] / metric[2])
         test_acc.append(evaluate_accuracy_gpu(net, test_iter))
         time_l.append(end-start)
-        print(f"\tEpoch {epoch+1:>2}, Using Time : {time_l[-1]:.4f}, train_acc : {train_acc[-1]:.4f} test_acc : {test_acc[-1]:.4f}")
+        if (epoch+1) % 5 == 0:
+            print(f"\tEpoch {epoch+1:>2}, Using Time : {time_l[-1]:.4f}, train_acc : {train_acc[-1]:.4f} test_acc : {test_acc[-1]:.4f}")
     return train_l, train_acc, test_acc
 
-def k_fold(k, X_train, y_train, net, num_epochs, learning_rate, batch_size, device):
+def k_fold(k, X_train, y_train, net, num_epochs, learning_rate, batch_size):
+    def init_weight(m):
+        if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv2d:
+            torch.nn.init.xavier_uniform_(m.weight) # Pytorch use a=sqrt(5)
+    net.apply(init_weight)
     """ K折训练 """
     train_l_sum, train_acc_sum, valid_l_sum = 0, 0, 0
     for i in range(k):
@@ -332,8 +283,8 @@ if __name__ == "__main__":
     print()
     net.to(device)
 
-    k, num_epochs, lr, batch_size = 3, 100, 0.2, 128
-    train_l, train_acc, valid_l, net = k_fold(k, train_features, train_labels, net, num_epochs, lr, batch_size, device)
+    k, num_epochs, lr, batch_size = 3, 100, 0.1, 196
+    train_l, train_acc, valid_l, net = k_fold(k, train_features, train_labels, net, num_epochs, lr, batch_size)
     print(f'{k}-折验证: 平均训练loss: {float(train_l):.4f}, 平均训练acc: {train_acc:.4f}, 平均验证loss: {float(valid_l):.4f}')
     torch.save(net, os.path.join(".", f"{net_name}_{train_l:.3f}.pkl"))
 
@@ -351,11 +302,9 @@ if __name__ == "__main__":
 
     out = index_map_to_label(out, index)
     out = np.array(out)
-    print(out.reshape(1, -1).shape)
     test = pd.read_csv(os.path.join('.', 'test.csv'))
     test['label'] = pd.Series(out.reshape(1, -1)[0])
     submission = pd.concat([test['image'], test['label']], axis=1)
-    print(submission.shape)
     submission.to_csv(os.path.join('.', f'{net_name}.csv'), index=False)
 
     all_program_end = time.perf_counter()
